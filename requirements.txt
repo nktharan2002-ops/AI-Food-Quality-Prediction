@@ -1,10 +1,10 @@
 Flask==2.3.3
-Pillow>=10.0.0
-pytesseract==0.3.10
+Pillow>=10.4.0
+pytesseract==0.3.13
 numpy==1.26.4
-opencv-python-headless==4.8.1.78
-pandas==2.1.4
+opencv-python-headless==4.10.0.84
+pandas==2.2.2
 gunicorn==21.2.0
-google-generativeai>=0.3.0
-python-dotenv>=1.0.0
-Werkzeug>=2.3.0
+google-generativeai>=0.8.3
+python-dotenv>=1.0.1
+Werkzeug>=3.0.3
