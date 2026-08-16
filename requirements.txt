@@ -7,3 +7,4 @@ google-genai>=1.0.0
 python-dotenv>=1.0.0
 Werkzeug>=2.3.0
 gunicorn==21.2.0
+google-generativeai
