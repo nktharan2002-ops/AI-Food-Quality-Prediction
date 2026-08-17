@@ -1,4 +1,5 @@
 Flask==2.3.3
+gunicorn>=21.2.0
 Pillow==10.1.0
 pytesseract==0.3.10
 numpy==1.24.3
@@ -8,4 +9,3 @@ reports==1.6.1
 google-genai>=0.4.0
 python-dotenv>=1.0.0
 Werkzeug>=2.3.0
-gunicorn>=21.2.0

@@ -53,16 +53,8 @@ if GEMINI_API_KEY:
         print(f"OK Gemini client configured successfully")
         print(f"Using configured model: {gemini_model}")
         
-        # List models for diagnostics only. Do not replace GEMINI_MODEL with a
-        # discovered model: availability varies by account and region.
-        try:
-            models_response = client.models.list()
-            for model_obj in models_response:
-                available_gemini_models.append(model_obj.name)
-                print(f"  OK Available: {model_obj.name}")
-        except Exception as model_error:
-            print(f"  Note: Could not list models (this is normal): {str(model_error)[:100]}")
-            # The configured model is still used; generation failure falls back to OCR.
+        # Do not call the network to list models during application import.
+        # Blocking startup here can make a Gunicorn worker exceed its boot timeout.
         
         print("=" * 50)
     except Exception as e:
@@ -428,6 +420,13 @@ def is_temporary_gemini_error(error):
 
 def secondary_flash_models():
     """Use only models the API reported as available; never replace the configured primary."""
+    global available_gemini_models
+    if not available_gemini_models:
+        try:
+            available_gemini_models = [model.name for model in client.models.list()]
+        except Exception as error:
+            print(f'Could not discover a secondary Gemini model: {error}')
+            return []
     configured_name = gemini_model.removeprefix('models/')
     return [name for name in available_gemini_models
             if name.removeprefix('models/') != configured_name
