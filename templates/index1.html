@@ -166,6 +166,56 @@
             transform: scale(1.1);
             border-color: var(--primary);
         }
+
+        .upload-option {
+            width: 100%;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 16px;
+            margin-bottom: 12px;
+            border: 1px solid #dbe5f5;
+            border-radius: 14px;
+            background: #fff;
+            color: var(--dark);
+            text-align: left;
+            font-weight: 600;
+            transition: background 0.2s ease, border-color 0.2s ease;
+        }
+
+        .upload-option:hover, .upload-option:focus {
+            background: #eef5ff;
+            border-color: var(--primary);
+        }
+
+        .upload-option i {
+            width: 42px;
+            height: 42px;
+            display: inline-grid;
+            place-items: center;
+            border-radius: 50%;
+            color: #fff;
+            background: var(--primary);
+            font-size: 1.2rem;
+        }
+
+        .upload-option small {
+            display: block;
+            color: #6c757d;
+            font-weight: 400;
+            margin-top: 2px;
+        }
+
+        @media (max-width: 576px) {
+            .upload-zone {
+                padding: 40px 16px;
+                margin: 20px 0;
+            }
+
+            .hero-section {
+                padding: 28px 16px;
+            }
+        }
     </style>
 </head>
 <body>
@@ -189,12 +239,12 @@
                             <div class="upload-zone" id="dropZone">
                                 <i class="fas fa-cloud-upload-alt fa-4x mb-3" style="color: var(--primary);"></i>
                                 <h3>Upload Nutrition Label</h3>
-                                <p class="text-muted mb-4">Drag & drop or click to upload image</p>
-                                <input type="file" id="fileInput" name="file" class="d-none" accept="image/*">
-                                <label for="fileInput" class="btn btn-lg btn-outline-primary">
-                                    <i class="fas fa-folder-open me-2"></i>Choose File
-                                </label>
-                                <p class="mt-3 small text-muted">Supports: JPG, PNG, GIF, WEBP</p>
+                                <p class="text-muted mb-4">Drag & drop or tap to upload an image</p>
+                                <input type="file" id="fileInput" name="file" class="d-none" accept="image/jpeg,image/png,image/webp">
+                                <button type="button" id="uploadTrigger" class="btn btn-lg btn-outline-primary">
+                                    <i class="fas fa-cloud-arrow-up me-2"></i>Upload Image
+                                </button>
+                                <p class="mt-3 small text-muted">Supports: JPG, JPEG, PNG, WEBP</p>
 
                                 <div class="preview-container mt-4">
                                     <img id="imagePreview" class="preview-image" alt="Preview">
@@ -213,6 +263,31 @@
                                 </button>
                             </div>
                         </form>
+
+                        <div class="modal fade" id="uploadChoiceModal" tabindex="-1" aria-labelledby="uploadChoiceTitle" aria-hidden="true">
+                            <div class="modal-dialog modal-dialog-centered">
+                                <div class="modal-content border-0 shadow">
+                                    <div class="modal-header border-0 pb-0">
+                                        <h5 class="modal-title" id="uploadChoiceTitle">Add nutrition label</h5>
+                                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                                    </div>
+                                    <div class="modal-body pt-3">
+                                        <button type="button" class="upload-option" data-upload-source="camera">
+                                            <i class="fas fa-camera"></i>
+                                            <span>📷 Take Photo<small>Use your phone camera</small></span>
+                                        </button>
+                                        <button type="button" class="upload-option" data-upload-source="gallery">
+                                            <i class="fas fa-image"></i>
+                                            <span>🖼️ Choose from Gallery<small>Select an existing photo</small></span>
+                                        </button>
+                                        <button type="button" class="upload-option" data-upload-source="file">
+                                            <i class="fas fa-folder-open"></i>
+                                            <span>📁 Choose File<small>Browse files on your device</small></span>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                     
                     <div class="col-lg-6">
@@ -302,6 +377,9 @@
         const uploadForm = document.getElementById('uploadForm');
         const loadingSpinner = document.getElementById('loadingSpinner');
         const analyzeBtn = document.getElementById('analyzeBtn');
+        const uploadTrigger = document.getElementById('uploadTrigger');
+        const uploadChoiceModal = new bootstrap.Modal(document.getElementById('uploadChoiceModal'));
+        const supportedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
         
         // Drag & Drop Events
         ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
@@ -343,15 +421,49 @@
             handleFiles(this.files);
         });
         
-        // Click drop zone to trigger file input
-        dropZone.addEventListener('click', () => {
-            fileInput.click();
+        function isMobileUploadExperience() {
+            return window.matchMedia('(max-width: 768px) and (pointer: coarse)').matches;
+        }
+
+        function openUploadSelector() {
+            if (isMobileUploadExperience()) {
+                uploadChoiceModal.show();
+            } else {
+                fileInput.removeAttribute('capture');
+                fileInput.click();
+            }
+        }
+
+        uploadTrigger.addEventListener('click', (event) => {
+            event.stopPropagation();
+            openUploadSelector();
+        });
+
+        // Clicking the existing upload zone uses the same mobile chooser.
+        dropZone.addEventListener('click', (event) => {
+            if (event.target === fileInput || event.target.closest('#uploadTrigger')) return;
+            openUploadSelector();
+        });
+
+        document.querySelectorAll('[data-upload-source]').forEach(button => {
+            button.addEventListener('click', () => {
+                const source = button.dataset.uploadSource;
+                fileInput.value = '';
+                fileInput.accept = 'image/jpeg,image/png,image/webp';
+                if (source === 'camera') {
+                    fileInput.setAttribute('capture', 'environment');
+                } else {
+                    fileInput.removeAttribute('capture');
+                }
+                uploadChoiceModal.hide();
+                fileInput.click();
+            });
         });
         
         // Process files
         function handleFiles(files) {
             const file = files[0];
-            if (file && file.type.startsWith('image/')) {
+            if (file && supportedImageTypes.has(file.type)) {
                 // Show preview
                 const reader = new FileReader();
                 reader.onload = function(e) {
@@ -362,6 +474,8 @@
                     analyzeBtn.disabled = false;
                 };
                 reader.readAsDataURL(file);
+            } else if (file) {
+                alert('Please choose a JPG, JPEG, PNG, or WEBP image.');
             }
         }
         
