@@ -2,11 +2,12 @@ import os
 import base64
 import json
 import re
+import time
 from flask import Flask, render_template, request, jsonify, session
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
-import google.generativeai as genai
-from PIL import Image
+from google import genai
+from PIL import Image, ImageOps
 import io
 import pytesseract
 import cv2
@@ -22,7 +23,7 @@ print(f"File exists: {env_path.exists()}")
 
 if env_path.exists():
     load_dotenv(env_path)
-    print("✓ Loaded .env file")
+    print("Loaded .env file")
 else:
     load_dotenv()  # Try default location
     print("Using default .env location")
@@ -32,74 +33,44 @@ app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key-change-in-production')
 app.config['UPLOAD_FOLDER'] = 'static/uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB
 
-# Configure Gemini
+# Configure Gemini using new google-genai SDK
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 print(f"GEMINI_API_KEY found: {'Yes' if GEMINI_API_KEY else 'No'}")
 gemini_available = False
-model = None
+client = None
+available_gemini_models = []
+# The model is controlled by .env; model discovery below is informational only.
+gemini_model = os.getenv('GEMINI_MODEL', 'gemini-3.5-flash')
 
 if GEMINI_API_KEY:
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        
-        # List available models first
         print("=" * 50)
-        print("Checking available Gemini models...")
-        available_model_names = []
+        print("Configuring Gemini client using new google-genai SDK...")
+        
+        # Create Gemini client with API key
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        gemini_available = True
+        print(f"OK Gemini client configured successfully")
+        print(f"Using configured model: {gemini_model}")
+        
+        # List models for diagnostics only. Do not replace GEMINI_MODEL with a
+        # discovered model: availability varies by account and region.
         try:
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    available_model_names.append(m.name)
-                    print(f"  ✓ Available: {m.name}")
-        except Exception as list_error:
-            print(f"  Could not list models: {list_error}")
+            models_response = client.models.list()
+            for model_obj in models_response:
+                available_gemini_models.append(model_obj.name)
+                print(f"  OK Available: {model_obj.name}")
+        except Exception as model_error:
+            print(f"  Note: Could not list models (this is normal): {str(model_error)[:100]}")
+            # The configured model is still used; generation failure falls back to OCR.
         
-        # Use the first available model that supports vision/images
-        # Priority: models with vision capability
-        vision_models = [name for name in available_model_names if 'vision' in name.lower() or 'flash' in name.lower() or 'pro' in name.lower()]
-        
-        if vision_models:
-            # Use the first vision-capable model
-            model_name = vision_models[0]
-            print(f"  Using model: {model_name}")
-            model = genai.GenerativeModel(model_name)
-            gemini_available = True
-            print(f"✓ Gemini API configured successfully with model: {model_name}")
-        elif available_model_names:
-            # Use any available model
-            model_name = available_model_names[0]
-            print(f"  Using model: {model_name}")
-            model = genai.GenerativeModel(model_name)
-            gemini_available = True
-            print(f"✓ Gemini API configured successfully with model: {model_name}")
-        else:
-            # Try common model names as fallback
-            fallback_models = [
-                'gemini-pro-vision',
-                'gemini-pro',
-                'gemini-1.0-pro-vision-latest',
-                'gemini-1.0-pro',
-            ]
-            for model_name in fallback_models:
-                try:
-                    print(f"  Trying fallback model: {model_name}...")
-                    model = genai.GenerativeModel(model_name)
-                    gemini_available = True
-                    print(f"✓ Gemini API configured with fallback model: {model_name}")
-                    break
-                except Exception as e:
-                    print(f"    Failed: {str(e)[:80]}")
-                    continue
-        
-        if not gemini_available:
-            print("⚠ No Gemini models available. Using Tesseract OCR only.")
         print("=" * 50)
     except Exception as e:
-        print(f"⚠ Gemini API configuration failed: {e}")
+        print(f"WARNING Gemini API configuration failed: {e}")
         import traceback
         traceback.print_exc()
 else:
-    print("⚠ GEMINI_API_KEY not found in .env file. Using Tesseract OCR only.")
+    print("WARNING GEMINI_API_KEY not found in .env file. Using Tesseract OCR only.")
 
 # Health scoring criteria
 HEALTH_CRITERIA = {
@@ -383,146 +354,233 @@ def parse_nutrition_from_text(raw_text):
     
     return nutrition_data
 
+NUTRITION_FIELDS = ('serving_size', 'servings_per_container', 'calories', 'total_fat',
+                    'saturated_fat', 'trans_fat', 'cholesterol', 'sodium',
+                    'total_carbohydrate', 'dietary_fiber', 'total_sugars',
+                    'added_sugars', 'protein', 'vitamin_d', 'calcium', 'iron', 'potassium')
+
+NUTRITION_RESPONSE_SCHEMA = {
+    'type': 'object', 'required': ['nutrition_facts', 'ingredients', 'health_claims',
+                                    'allergens', 'analysis_notes', 'raw_text'],
+    'properties': {
+        'nutrition_facts': {
+            'type': 'object', 'required': list(NUTRITION_FIELDS),
+            'properties': {
+                'serving_size': {'anyOf': [{'type': 'string'}, {'type': 'null'}]},
+                **{field: {'anyOf': [{'type': 'number'}, {'type': 'null'}]}
+                   for field in NUTRITION_FIELDS if field != 'serving_size'}
+            }
+        },
+        'ingredients': {'anyOf': [{'type': 'string'}, {'type': 'null'}]},
+        'health_claims': {'type': 'array', 'items': {'type': 'string'}},
+        'allergens': {'type': 'array', 'items': {'type': 'string'}},
+        'analysis_notes': {'type': 'string'},
+        'raw_text': {'type': 'string'}
+    }
+}
+
+NUTRITION_PROMPT = """Extract nutrition information from this label. Identify the
+nutrition table first, then select ONE column. Prefer the Per Serving column for
+ONQI; use Per 100 g only if no serving column exists and state that in analysis_notes.
+Never mix columns. Preserve printed decimal values exactly, distinguish kcal from kJ,
+and grams from milligrams. Never invent a value: return null when it cannot be read
+confidently. Extract ingredients, health claims, allergens, and raw visible text when
+available. The response schema is supplied separately; fill every schema field."""
+
+JSON_REPAIR_PROMPT = """Return only a complete response that conforms exactly to the
+provided JSON schema. Re-read the nutrition table, use a single Per Serving column,
+preserve decimals, and use null for uncertain values. Do not include markdown."""
+
+def prepare_image_for_gemini(image_path):
+    """Correct orientation and preserve readable label detail without aggressive compression."""
+    with Image.open(image_path) as image:
+        image = ImageOps.exif_transpose(image).convert('RGB')
+        max_dimension = 2400
+        if max(image.size) > max_dimension:
+            image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+        print(f"Image prepared: {image.size}, RGB")
+        image_bytes = io.BytesIO()
+        image.save(image_bytes, format='JPEG', quality=95, subsampling=0, optimize=True)
+    return image_bytes.getvalue()
+
+def parse_gemini_json(response_text):
+    """Accept schema JSON even if a provider adds a fence or explanatory text."""
+    cleaned = (response_text or '').strip()
+    cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', cleaned, flags=re.IGNORECASE)
+    start, end = cleaned.find('{'), cleaned.rfind('}')
+    if start < 0 or end < start:
+        raise ValueError('No JSON object found in Gemini response')
+    data = json.loads(cleaned[start:end + 1])
+    if not isinstance(data, dict) or not isinstance(data.get('nutrition_facts'), dict):
+        raise ValueError('Gemini response does not contain nutrition_facts')
+    required_top_level = ('ingredients', 'health_claims', 'allergens', 'analysis_notes', 'raw_text')
+    missing_top_level = [field for field in required_top_level if field not in data]
+    if missing_top_level:
+        raise ValueError(f'Gemini response is missing required keys: {", ".join(missing_top_level)}')
+    missing = [field for field in NUTRITION_FIELDS if field not in data['nutrition_facts']]
+    if missing:
+        raise ValueError(f'Gemini response is missing nutrition fields: {", ".join(missing)}')
+    return normalize_nutrition_data(data)
+
+def is_temporary_gemini_error(error):
+    message = str(error).upper()
+    return '503' in message or 'UNAVAILABLE' in message or 'RESOURCE_EXHAUSTED' in message
+
+def secondary_flash_models():
+    """Use only models the API reported as available; never replace the configured primary."""
+    configured_name = gemini_model.removeprefix('models/')
+    return [name for name in available_gemini_models
+            if name.removeprefix('models/') != configured_name
+            and 'gemini-3' in name.lower() and 'flash' in name.lower()]
+
+def request_gemini_analysis(model_name, image_part, prompt):
+    return client.models.generate_content(
+        model=model_name,
+        contents=[prompt, image_part],
+        config=genai.types.GenerateContentConfig(
+            response_mime_type='application/json',
+            response_json_schema=NUTRITION_RESPONSE_SCHEMA,
+            temperature=0
+        )
+    )
+
 def analyze_nutrition_with_gemini(image_path):
-    """Use Gemini Vision API to analyze nutrition label"""
-    global gemini_available, model
-    
-    if not gemini_available or model is None:
-        print("Gemini not available, using Tesseract OCR")
-        return analyze_nutrition_with_tesseract(image_path)
-    
-    try:
-        print(f"=== Analyzing image with Gemini AI ===")
-        print(f"Image path: {image_path}")
-        
-        # Open and prepare image
-        img = Image.open(image_path)
-        print(f"Image size: {img.size}, mode: {img.mode}")
-        
-        # Prepare prompt
-        prompt = """Analyze this nutrition facts label and extract ALL information in JSON format.
-        Look for these specific fields:
-        1. serving_size (with units)
-        2. servings_per_container
-        3. calories
-        4. total_fat (in grams)
-        5. saturated_fat (in grams)
-        6. trans_fat (in grams)
-        7. cholesterol (in mg)
-        8. sodium (in mg)
-        9. total_carbohydrate (in grams)
-        10. dietary_fiber (in grams)
-        11. total_sugars (in grams)
-        12. added_sugars (in grams)
-        13. protein (in grams)
-        14. vitamin_d (in %DV)
-        15. calcium (in %DV)
-        16. iron (in %DV)
-        17. potassium (in %DV)
-        
-        Also analyze:
-        - Ingredients list (if visible)
-        - Any health claims (organic, low-fat, etc.)
-        - Allergen information
-        
-        Return ONLY a valid JSON object with this structure:
-        {
-            "nutrition_facts": {
-                "serving_size": "value",
-                "servings_per_container": value,
-                "calories": value,
-                "total_fat": value,
-                "saturated_fat": value,
-                "trans_fat": value,
-                "cholesterol": value,
-                "sodium": value,
-                "total_carbohydrate": value,
-                "dietary_fiber": value,
-                "total_sugars": value,
-                "added_sugars": value,
-                "protein": value,
-                "vitamin_d": value,
-                "calcium": value,
-                "iron": value,
-                "potassium": value
-            },
-            "ingredients": "list of ingredients",
-            "health_claims": ["list", "of", "claims"],
-            "allergens": ["list", "of", "allergens"],
-            "analysis_notes": "brief analysis notes",
-            "raw_text": "the full raw text extracted from the nutrition label"
-        }
-        
-        If any field is not visible, use null or 0 as appropriate."""
-        
-        # Use Gemini to analyze the image
-        print("Sending image to Gemini API...")
-        response = model.generate_content([prompt, img])
-        
-        # Extract JSON from response
-        response_text = response.text
-        print(f"=== Gemini Response ({len(response_text)} chars) ===")
-        print(response_text[:1000] if len(response_text) > 1000 else response_text)
-        print("=== End Gemini Response ===")
-        
-        # Find JSON in the response (sometimes Gemini adds extra text)
-        try:
-            # Look for JSON pattern
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
-            
-            if json_start == -1 or json_end == 0:
-                print("No JSON found in response, using Tesseract fallback")
-                return analyze_nutrition_with_tesseract(image_path)
-            
-            json_str = response_text[json_start:json_end]
-            
-            # Parse JSON
-            data = json.loads(json_str)
-            data['analysis_notes'] = "Analyzed using Gemini Vision AI"
-            
-            # Print extracted values
-            print("=== Gemini Extracted Nutrition Facts ===")
-            for k, v in data.get('nutrition_facts', {}).items():
-                print(f"  {k}: {v}")
-            print("=========================================")
-            
-            return data
-            
-        except json.JSONDecodeError as e:
-            print(f"JSON parsing failed: {e}")
-            print(f"JSON string attempted: {json_str[:500] if json_str else 'None'}")
-            # Fallback to Tesseract if JSON parsing fails
-            return analyze_nutrition_with_tesseract(image_path)
-            
-    except Exception as e:
-        print(f"Error with Gemini API: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        # Fallback to Tesseract OCR
+    """Use Gemini first, retrying temporary failures before using OCR as a last resort."""
+    if not gemini_available or client is None:
+        print('Gemini not available; using Tesseract as the last fallback.')
         return analyze_nutrition_with_tesseract(image_path)
 
+    try:
+        image_part = genai.types.Part.from_bytes(data=prepare_image_for_gemini(image_path),
+                                                  mime_type='image/jpeg')
+    except Exception as error:
+        print(f'Unable to prepare image for Gemini: {error}')
+        return analyze_nutrition_with_tesseract(image_path)
+
+    # The configured model is always first. A discovered secondary is used only
+    # after an availability error, not as an automatic configuration override.
+    models_to_try = [gemini_model]
+    max_retries = 3
+    for model_index, model_name in enumerate(models_to_try):
+        for attempt in range(1, max_retries + 1):
+            try:
+                print('\n=== GEMINI ANALYSIS ===')
+                print(f'Model: {model_name}')
+                print(f'Attempt: {attempt}/{max_retries}')
+                print(f'Image: {image_path}')
+                response = request_gemini_analysis(model_name, image_part, NUTRITION_PROMPT)
+                print('Response received: YES')
+                try:
+                    data = parse_gemini_json(response.text)
+                except (json.JSONDecodeError, ValueError) as parse_error:
+                    print(f'JSON parsing failed: {parse_error}. Retrying once with JSON-only prompt.')
+                    repair_response = request_gemini_analysis(model_name, image_part, JSON_REPAIR_PROMPT)
+                    data = parse_gemini_json(repair_response.text)
+
+                data['analysis_notes'] = data.get('analysis_notes') or 'Analyzed using Gemini Vision AI'
+                data['extraction_reliable'] = True
+                facts = data['nutrition_facts']
+                print('\n=== PARSED NUTRITION ===')
+                for field in ('calories', 'total_fat', 'saturated_fat', 'total_carbohydrate',
+                              'dietary_fiber', 'total_sugars', 'protein'):
+                    print(f'{field.replace("_", " ").title()}: {facts.get(field)}')
+                return data
+            except Exception as error:
+                print(f'Gemini attempt {attempt} failed: {error}')
+                if is_temporary_gemini_error(error) and attempt < max_retries:
+                    delay = 2 ** (attempt - 1)
+                    print(f'Retrying in {delay} seconds...')
+                    time.sleep(delay)
+                    continue
+                if is_temporary_gemini_error(error) and model_index == 0:
+                    secondary = secondary_flash_models()
+                    if secondary:
+                        models_to_try.append(secondary[0])
+                        print(f'Configured model unavailable; trying secondary available Flash model: {secondary[0]}')
+                break
+
+    print('Gemini could not provide reliable data after retries; using Tesseract fallback.')
+    return analyze_nutrition_with_tesseract(image_path)
+
 def analyze_nutrition_with_tesseract(image_path):
-    """Fallback: Use Tesseract OCR to analyze nutrition label"""
-    print("Using Tesseract OCR for text extraction...")
-    
-    # Extract raw text
+    """Last-resort OCR fallback; reject values that would corrupt ONQI."""
+    print('Using Tesseract OCR as the last fallback...')
     raw_text = extract_text_with_tesseract(image_path)
-    
-    if not raw_text:
-        return {
-            "nutrition_facts": {},
-            "ingredients": "",
-            "health_claims": [],
-            "allergens": [],
-            "analysis_notes": "Failed to extract text from image. Please ensure the image is clear and contains a nutrition label.",
-            "raw_text": ""
-        }
-    
-    # Parse nutrition data from text
-    nutrition_data = parse_nutrition_from_text(raw_text)
-    
+    nutrition_data = normalize_nutrition_data(parse_nutrition_from_text(raw_text))
+    if not validate_ocr_nutrition_data(nutrition_data):
+        nutrition_data['nutrition_facts'] = {}
+        nutrition_data['extraction_reliable'] = False
+        nutrition_data['analysis_notes'] = (
+            'Unable to confidently extract nutrition data from this image. '
+            'Please upload a clearer nutrition label.'
+        )
+    else:
+        nutrition_data['extraction_reliable'] = True
+        nutrition_data['analysis_notes'] = 'Extracted using Tesseract OCR (fallback)'
     return nutrition_data
+
+def validate_ocr_nutrition_data(data):
+    """Reject impossible OCR readings instead of producing a misleading health score."""
+    facts = data.get('nutrition_facts', {})
+    if not facts:
+        print('OCR validation: no nutrition facts found.')
+        return False
+
+    def number(field):
+        try:
+            return float(facts.get(field, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    gram_fields = ('total_fat', 'saturated_fat', 'trans_fat', 'total_carbohydrate',
+                   'dietary_fiber', 'total_sugars', 'added_sugars', 'protein')
+    for field in gram_fields:
+        value = number(field)
+        if value < 0 or value > 100:
+            print(f'OCR validation rejected {field}: {value}g is implausible per serving.')
+            return False
+
+    if number('calories') > 3000 or number('sodium') > 10000 or number('cholesterol') > 3000:
+        print('OCR validation rejected an implausible calorie, sodium, or cholesterol value.')
+        return False
+    if number('saturated_fat') > number('total_fat') or number('dietary_fiber') > number('total_carbohydrate'):
+        print('OCR validation rejected inconsistent nutrient totals.')
+        return False
+    if sum(number(field) for field in ('total_fat', 'total_carbohydrate', 'protein')) > 125:
+        print('OCR validation rejected implausible macronutrient total.')
+        return False
+    return any(number(field) > 0 for field in ('calories', 'total_fat', 'total_carbohydrate', 'protein'))
+
+def normalize_nutrition_data(data):
+    """Make model/OCR output safe and consistent for the result template."""
+    if not isinstance(data, dict):
+        return {"nutrition_facts": {}, "ingredients": "", "health_claims": [],
+                "allergens": [], "analysis_notes": "No nutrition data extracted", "raw_text": ""}
+
+    facts = data.get('nutrition_facts') or {}
+    if not isinstance(facts, dict):
+        facts = {}
+
+    aliases = {
+        'sugars': 'total_sugars', 'carbohydrates': 'total_carbohydrate',
+        'carbs': 'total_carbohydrate', 'fiber': 'dietary_fiber'
+    }
+    cleaned_facts = {}
+    for key, value in facts.items():
+        key = aliases.get(str(key).strip().lower().replace(' ', '_'), str(key).strip().lower())
+        if value in (None, '', 'null', 'N/A', 'n/a'):
+            continue
+        if key != 'serving_size' and isinstance(value, str):
+            number = re.search(r'-?\d+(?:\.\d+)?', value.replace(',', ''))
+            value = float(number.group()) if number else value
+        cleaned_facts[key] = value
+
+    data['nutrition_facts'] = cleaned_facts
+    data['ingredients'] = data.get('ingredients') or ''
+    data['health_claims'] = data.get('health_claims') or []
+    data['allergens'] = data.get('allergens') or []
+    data['raw_text'] = data.get('raw_text') or ''
+    return data
 
 def calculate_onqi_score(nutrition_facts):
     """
@@ -580,8 +638,8 @@ def calculate_onqi_score(nutrition_facts):
                     sugar_value > 0, protein > 0, dietary_fiber > 0])
     
     if not has_data:
-        print("\n⚠ WARNING: No nutrition data extracted! Returning score of 50 (unknown)")
-        return 50  # Return middle score if no data
+        print("\nNo reliable nutrition data extracted; ONQI will not be calculated.")
+        return 0
     
     # ===== ONQI CALCULATION =====
     # Start with base score of 50 (neutral)
@@ -701,6 +759,14 @@ def get_health_analysis(nutrition_data, onqi_score):
     }
     
     nutrition_facts = nutrition_data.get('nutrition_facts', {})
+    if nutrition_data.get('extraction_reliable') is False:
+        analysis.update({
+            'score': 0,
+            'rating': 'Unable to assess',
+            'summary': 'Unable to confidently extract nutrition data from this image, so no ONQI score was calculated.',
+            'recommendations': ['Upload a clearer, straight-on image of the nutrition table.']
+        })
+        return analysis
     
     # Get values with safe defaults
     saturated_fat = float(nutrition_facts.get('saturated_fat', 0) or 0)
@@ -723,7 +789,7 @@ def get_health_analysis(nutrition_data, onqi_score):
         analysis['rating'] = 'Good 👍'
         analysis['summary'] = 'This is a healthy food choice with good nutritional value.'
     elif onqi_score >= 40:
-        analysis['rating'] = 'Fair ⚠️'
+        analysis['rating'] = 'Fair WARNING️'
         analysis['summary'] = 'This food has moderate nutritional value. Consider consuming in moderation.'
     elif onqi_score >= 20:
         analysis['rating'] = 'Poor 👎'
