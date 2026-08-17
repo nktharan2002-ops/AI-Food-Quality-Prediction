@@ -384,15 +384,28 @@ provided JSON schema. Re-read the nutrition table, use a single Per Serving colu
 preserve decimals, and use null for uncertain values. Do not include markdown."""
 
 def prepare_image_for_gemini(image_path):
-    """Correct orientation and preserve readable label detail without aggressive compression."""
+    """Correct orientation and resize images to reduce memory usage while preserving label readability."""
     with Image.open(image_path) as image:
         image = ImageOps.exif_transpose(image).convert('RGB')
-        max_dimension = 2400
+
+        max_dimension = 1280
+
         if max(image.size) > max_dimension:
-            image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+            image.thumbnail(
+                (max_dimension, max_dimension),
+                Image.Resampling.LANCZOS
+            )
+
         print(f"Image prepared: {image.size}, RGB")
+
         image_bytes = io.BytesIO()
-        image.save(image_bytes, format='JPEG', quality=95, subsampling=0, optimize=True)
+        image.save(
+            image_bytes,
+            format='JPEG',
+            quality=85,
+            optimize=True
+        )
+
     return image_bytes.getvalue()
 
 def parse_gemini_json(response_text):
